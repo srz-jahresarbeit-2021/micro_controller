@@ -7,6 +7,9 @@
 #include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
 
 #include <Arduino.h>
+
+#include <I2S.h>
+
 //API for the bme280 temp/hum/pres sensor
 #include <Bme280.h>
 //MQTT client
@@ -17,6 +20,7 @@
 #define DRD_TIMEOUT 20
 #define DRD_address 0 
 #define UPDATE_TIME 60000
+#define MICROPHONE_SAMPLES 128
 
 
 DoubleResetDetector drd(DRD_TIMEOUT, DRD_address);
@@ -216,11 +220,11 @@ void loop() {
     }
     client.loop();
 
-    auto temperature = String(bmesensor.getTemperature()) + " °C";
+    auto temperature = String(bmesensor.getTemperature());
     upload("temp", temperature);
-    auto pressure = String(bmesensor.getPressure() / 100.0) + " hPa";
+    auto pressure = String(bmesensor.getPressure() / 100.0);
     upload("press", pressure);
-    auto humidity = String(bmesensor.getHumidity()) + " %";
+    auto humidity = String(bmesensor.getHumidity());
     upload("hum", humidity);
 
     delay(UPDATE_TIME);
