@@ -1,4 +1,4 @@
-#include <LittleFS.h>                 //this needs to be first, or it all crashes and burns...
+#include <LittleFS.h>                 /
 
 #include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
 
@@ -8,16 +8,22 @@
 
 #include <Arduino.h>
 
+#include <SoftwareSerial.h>
+
 #include <I2S.h>
 
+#include <vector>
+
 //API for the bme280 temp/hum/pres sensor
-#include <Bme280.h>
+#include <Bme280.h>               //https://github.com/malokhvii-eduard/arduino-bme280
 //MQTT client
-#include <PubSubClient.h>
+#include <PubSubClient.h>         //https://github.com/knolleary/pubsubclient
 
 //detects double press of the reset button by setting a flag in ESP8266 RTC Memory
 //double press triggers reconfiguration of the device 
-#include <ESP_DoubleResetDetector.h>
+#include <ESP_DoubleResetDetector.h>  //https://github.com/khoih-prog/ESP_DoubleResetDetector
+
+#include <MHZ19.h>                //https://github.com/WifWaf/MH-Z19
  
 //in seconds
 #define DRD_TIMEOUT 1   
@@ -27,6 +33,10 @@ DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
 
 //TODO: maybe remove/make configurable
 #define UPDATE_TIME 60000
+#define PPM_RANGE 2000
+
+//max number of samples
+#define SAMPLES 256
 
 //loc of config file in fs
 char config_file[40] = "/config.json";
@@ -61,9 +71,19 @@ PubSubClient client(espClient);
 // Object for the Bme280 pressure/humidity/temperature sensor using i^2
 Bme280TwoWire bmesensor;
 
+// MHZ19 (CO2)
+MHZ19 myMHZ19;                       
+SoftwareSerial mySerial;                   // create device to MH-Z19 serial
+
+//time since last upload of data
+unsigned long lastMillis;
+
+//microphone samples
+std::vector<int> mic_samples[SAMPLES];
 
 //using mac address as id
 String device_macaddress;
+
 
 //callback notifying us of the need to save config
 void saveConfigCallback () {
@@ -91,20 +111,15 @@ void setup() {
 
   Serial.println();
 
-  read_config();
-
   pinMode(LED_BUILTIN, OUTPUT);
 
   if(!read_config() || drd.detectDoubleReset()){
     shouldConfig = true;
-    //LED = were in config mode
   }else{
-    //deactivate config mode
+    //deactivate led: no config mode
     pinMode(LED_BUILTIN, HIGH);
   }
-  // The extra parameters to be configured (can be either global or just in the setup)
-  // After connecting, parameter.getValue() will get you the configured value
-  // id/name placeholder/prompt default length
+  // The extra parameters to be configured
   WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
   WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 6);
   WiFiManagerParameter custom_mqtt_user("user", "mqtt username", mqtt_user, 40);
@@ -125,10 +140,9 @@ void setup() {
 
 
   //WiFiManager
-  //Local intialization. Once its business is done, there is no need to keep it around
   WiFiManager wifiManager;
 
-  //set config save notify callback
+  //set config save notify and ap callback 
   wifiManager.setSaveConfigCallback(saveConfigCallback);
   wifiManager.setAPCallback(configModeCallback);
 
@@ -147,10 +161,10 @@ void setup() {
   //fetches ssid, password and tries to connect to that AP
   if(shouldConfig){
     Serial.println("Refetching config");
-    wifiManager.startConfigPortal("AutoConnectAP", "password");
+    wifiManager.startConfigPortal(("AutoConnectAP" + device_macaddress).c_str(), "password");
   }else{
     Serial.println("Trying to connect to network");
-    if (!wifiManager.autoConnect("AutoConnectAP", "password")) {
+    if (!wifiManager.autoConnect(("AutoConnectAP" + device_macaddress).c_str(), "password")) {
         Serial.println("failed to connect and hit timeout");
         delay(3000);
         //reset and try again
@@ -158,7 +172,7 @@ void setup() {
         delay(5000);
     }
   }
-  //if you get here you have connected to the WiFi
+
   Serial.println("connected to wifi AP...");
 
   //read updated parameters
@@ -190,30 +204,66 @@ void setup() {
     write_config();
   }
 
+  //only for debugging purposes
   Serial.println("local ip");
   Serial.println(WiFi.localIP());
 
-
+  //tell pubsubclient where to find the mqtt server
   client.setServer(mqtt_server, String(mqtt_port).toInt());
   client.setKeepAlive(65);
 
-  Wire.begin(D2, D1);
 
-  bmesensor.begin(Bme280TwoWireAddress::Secondary);
-  bmesensor.setSettings(Bme280Settings::indoor());
+  //temperature via i2c
+  if(has_temp){
+    Wire.begin(pinSda, pinSdl);
 
+    bmesensor.begin(Bme280TwoWireAddress::Secondary);
+    bmesensor.setSettings(Bme280Settings::indoor());
+  }
+
+  //co2 via rx pin (serial)
+  if(has_co2) {
+    Serial.println("starting");
+    Serial.flush();
+    
+    //can pass either a software serial or the hardware serial
+    //usage of software serial will collide with hardware serial
+    //->noise when printing to serial monitor
+    //mySerial.begin(9600, SWSERIAL_8N1, RX, TX, false);
+    myMHZ19.begin(Serial);                              
+
+    myMHZ19.autoCalibration();                              // Turn auto calibration ON (takes ~ 20 minutes, will be done once every few months)
+    
+  }
+
+  //mic via i2s, is a bit iffy
+  if(has_mic){
+    // start I2S at 16 kHz with 32-bits per sample
+    if (!I2S.begin(I2S_PHILIPS_MODE, 16000, 32)) {
+      Serial.println("Failed to initialize I2S!");
+      while(1); //do nothing (shoud probably ask the user to reenter configs or something along those lines)
+    }
+  }
+
+  //LED off
   digitalWrite(LED_BUILTIN, HIGH);
-
+  //no double click to detect
   drd.stop();
 }
 
+//takes sensor type (co2/pressure/temp/...) 
+//and measurement value to publish to the mqtt broker
 void upload(String sensor_type, String data){
-    auto json_string = String("{\"sensor_type\":\"" + sensor_type + "\",\"measure_value\":\"" + data + "\",\"controller_id\":\"" + device_macaddress.c_str() + "\"}");
-    char json_char_array[json_string.length() + 1];
-    json_string.toCharArray(json_char_array, json_string.length() + 2);
-    Serial.println(json_char_array);
+    DynamicJsonDocument json(1024);
+    json["sensor_type"] = sensor_type;
+    json["measure_value"] = data;
+    json["controller_id"] = device_macaddress;
 
-    client.publish("/sensors/measurements", json_char_array);
+    String json_string;
+    serializeJson(json, json_string);
+    serializeJson(json, Serial);
+
+    client.publish("/sensors/measurements", json_string.c_str());
 }
 
 void loop() {
@@ -225,16 +275,37 @@ void loop() {
         send_sensor_config();
 
     }
+
+    if(millis() - lastMillis >= UPDATE_TIME){
+      lastMillis = millis();
+      if(has_temp){
+        auto temperature = String(bmesensor.getTemperature());
+        upload("temp", temperature);
+        auto pressure = String(bmesensor.getPressure() / 100.0);
+        upload("pressure", pressure);
+        auto humidity = String(bmesensor.getHumidity());
+        upload("humidity", humidity);
+      }
+      if(has_mic){}
+      if(has_co2){
+        int CO2; 
+
+        CO2 = myMHZ19.getCO2();              
+        
+        upload("co2", String(CO2));
+      }
+
+    }
     client.loop();
-
-    auto temperature = String(bmesensor.getTemperature());
-    upload("temp", temperature);
-    auto pressure = String(bmesensor.getPressure() / 100.0);
-    upload("pressure", pressure);
-    auto humidity = String(bmesensor.getHumidity());
-    upload("humidity", humidity);
-
-    delay(UPDATE_TIME);
+    if(has_mic){
+      int sample = 0; 
+      while ((sample == 0) || (sample == -1) ) {
+        sample = I2S.read();
+      }
+      // convert to 18 bit signed
+      sample >>= 14; 
+      mic_samples->push_back(sample);
+    }
 }
 
 bool read_config(){
@@ -249,7 +320,7 @@ bool read_config(){
       if (configFile) {
         Serial.println("opened config file");
         size_t size = configFile.size();
-        // Allocate a buffer to store contents of the file.
+        //allocate a buffer to store contents of the file
         std::unique_ptr<char[]> buf(new char[size]);
 
         configFile.readBytes(buf.get(), size);
@@ -289,7 +360,7 @@ bool read_config(){
   }
 }
 
-//TODO: catch errors
+//TODO: catch serialitations errors
 bool write_config(){
     Serial.println("saving config");
     DynamicJsonDocument json(1024);
@@ -320,6 +391,8 @@ bool write_config(){
     return true;
   }
 
+  //called once during microcontroller startup
+  //tells the server the new config
   void send_sensor_config(){
     DynamicJsonDocument json(1024);
     json["room_name"] = room_name;
@@ -333,6 +406,7 @@ bool write_config(){
 
     String json_string;
     serializeJson(json, json_string);
+    serializeJson(json, Serial);
 
     client.publish("/sensors/config", json_string.c_str());
   }
