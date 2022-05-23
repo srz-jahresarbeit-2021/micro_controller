@@ -32,6 +32,7 @@
 DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
 
 //TODO: maybe remove/make configurable
+//it would clutter the wifimanger page though
 #define UPDATE_TIME 60000
 #define PPM_RANGE 2000
 
@@ -54,7 +55,7 @@ char sensor_name[40];
 bool has_temp = false;
 bool has_mic = false;
 bool has_co2 = false;
-//advanced options for pins (not going to be implemented, could break too much -> only necessary if you change board pinout before runtime)
+//advanced options for pins (custom config not going to be implemented, could break too much -> only necessary if you change board pinout before runtime)
 unsigned int pinSda = D2;
 unsigned int pinSdl = D1;
 
@@ -68,12 +69,13 @@ bool shouldConfig = false;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// Object for the Bme280 pressure/humidity/temperature sensor using i^2
+// Object for the Bme280 pressure/humidity/temperature sensor using i2c
 Bme280TwoWire bmesensor;
 
 // MHZ19 (CO2)
-MHZ19 myMHZ19;                       
-SoftwareSerial mySerial;                   // create device to MH-Z19 serial
+MHZ19 myMHZ19;        
+//in case you dont want to use the hardware serial
+SoftwareSerial mySerial; 
 
 //time since last upload of data
 unsigned long lastMillis;
